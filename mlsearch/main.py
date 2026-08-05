@@ -9,14 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 from PIL import Image
-try:
-    import pillow_avif
-except Exception:
-    pass
 import requests
 import torch
 from sentence_transformers import SentenceTransformer
-from supabase import create_client, Client
 
 torch.set_num_threads(1)
 
@@ -37,7 +32,11 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://cnqukpjrxrtqqrmertuo.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNucXVrcGpyeHJ0cXFybWVydHVvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA1MzcxMTcsImV4cCI6MjA3NjExMzExN30.uQpavj2QhduGSYmRuqOvKS_H7pUhZVZNPWqqUIzw9_0")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "User-Agent": "Mozilla/5.0"
+}
 
 text_model = None
 clip_model = None
@@ -97,12 +96,13 @@ def preload_all_embeddings():
     global INDEXED_PRODUCTS, INDEXED_STORES, PRODUCT_TEXT_EMBEDDINGS, STORE_TEXT_EMBEDDINGS
     global INDEXED_IMAGE_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
     try:
-        print("⚡ Precomputing text & visual embeddings...")
+        print("⚡ Precomputing text & visual embeddings via REST API...")
         tm = get_text_model()
         cm = get_clip_model()
 
-        prod_res = supabase.table("product").select("prod_id, prod_name, prod_description, prod_image_urls, category, brand").execute()
-        raw_products = prod_res.data or []
+        prod_url = f"{SUPABASE_URL}/rest/v1/product?select=prod_id,prod_name,prod_description,prod_image_urls,category,brand"
+        prod_resp = requests.get(prod_url, headers=HEADERS, timeout=10)
+        raw_products = prod_resp.json() if prod_resp.status_code == 200 else []
         INDEXED_PRODUCTS = raw_products
 
         prod_texts = [
@@ -111,8 +111,9 @@ def preload_all_embeddings():
         ]
         PRODUCT_TEXT_EMBEDDINGS = tm.encode(prod_texts, normalize_embeddings=True) if prod_texts else np.empty((0, 384))
 
-        store_res = supabase.table("store_details").select("store_id, store_name, store_address, store_district, store_state").execute()
-        INDEXED_STORES = store_res.data or []
+        store_url = f"{SUPABASE_URL}/rest/v1/store_details?select=store_id,store_name,store_address,store_district,store_state"
+        store_resp = requests.get(store_url, headers=HEADERS, timeout=10)
+        INDEXED_STORES = store_resp.json() if store_resp.status_code == 200 else []
         store_texts = [
             f"{s.get('store_name') or ''} {s.get('store_address') or ''} {s.get('store_district') or ''} {s.get('store_state') or ''}".strip()
             for s in INDEXED_STORES
@@ -121,7 +122,6 @@ def preload_all_embeddings():
 
         indexed_img_prods = []
         img_embeddings_list = []
-        headers = {"User-Agent": "Mozilla/5.0"}
 
         for prod in raw_products:
             prod_id = prod.get("prod_id")
@@ -131,7 +131,7 @@ def preload_all_embeddings():
                 if not url or not url.startswith("http"):
                     continue
                 try:
-                    img_resp = requests.get(url, headers=headers, timeout=5)
+                    img_resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
                     if img_resp.status_code == 200:
                         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
                         img_emb = cm.encode(img, normalize_embeddings=True)
@@ -240,24 +240,23 @@ async def search_by_image(
 
     if not query_image and target_url:
         try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            resp = requests.get(target_url, headers=headers, timeout=5)
+            resp = requests.get(target_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
             if resp.status_code == 200:
                 query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
         except Exception as e:
             print(f"⚠️ Image URL fetch error: {e}")
 
     if not query_image:
-        res = supabase.table("product").select("prod_id").limit(top_k).execute()
-        pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
+        prod_resp = requests.get(f"{SUPABASE_URL}/rest/v1/product?select=prod_id&limit={top_k}", headers=HEADERS)
+        pids = [int(p["prod_id"]) for p in (prod_resp.json() or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
     cm = get_clip_model()
     query_embedding = cm.encode(query_image, normalize_embeddings=True)
 
     if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
-        res = supabase.table("product").select("prod_id").limit(top_k).execute()
-        pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
+        prod_resp = requests.get(f"{SUPABASE_URL}/rest/v1/product?select=prod_id&limit={top_k}", headers=HEADERS)
+        pids = [int(p["prod_id"]) for p in (prod_resp.json() or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
