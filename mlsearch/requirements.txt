@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+--find-links https://download.pytorch.org/whl/cpu/torch_stable.html
 torch
 sentence-transformers>=2.2.2
 fastapi>=0.100.0
