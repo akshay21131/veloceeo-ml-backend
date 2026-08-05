@@ -1,11 +1,16 @@
 import os
+import threading
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
 from supabase import create_client, Client
+
+# Limit PyTorch memory & CPU threads for Render 512MB RAM compatibility
+torch.set_num_threads(1)
 
 app = FastAPI(
     title="Veloceeo Live ML Semantic Search Service",
@@ -13,7 +18,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,15 +26,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Supabase Credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://cnqukpjrxrtqqrmertuo.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNucXVrcGpyeHJ0cXFybWVydHVvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA1MzcxMTcsImV4cCI6MjA3NjExMzExN30.uQpavj2QhduGSYmRuqOvKS_H7pUhZVZNPWqqUIzw9_0")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Load sentence transformer model
-MODEL_NAME = "all-MiniLM-L6-v2"
-model = SentenceTransformer(MODEL_NAME)
+model = None
 
 class SearchQueryRequest(BaseModel):
     query: str
@@ -41,80 +41,76 @@ class SearchMLResponse(BaseModel):
     product_ids: List[int]
     store_ids: List[int]
 
-# Cache in-memory vectors
 INDEXED_PRODUCTS = []
 INDEXED_STORES = []
 PRODUCT_EMBEDDINGS = None
 STORE_EMBEDDINGS = None
+IS_LOADING = False
+
+def get_model():
+    global model
+    if model is None:
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+    return model
 
 def reload_database_embeddings():
-    global INDEXED_PRODUCTS, INDEXED_STORES, PRODUCT_EMBEDDINGS, STORE_EMBEDDINGS
-    print("🔄 Fetching live products & stores from Supabase PostgreSQL database...")
-    
-    # 1. Fetch live products (In Python SDK, use .table() instead of reserved keyword .from())
-    prod_res = supabase.table("product").select("prod_id, prod_name, prod_description, category, brand").execute()
-    INDEXED_PRODUCTS = prod_res.data or []
-    
-    prod_texts = [
-        f"{p.get('prod_name') or ''} {p.get('prod_description') or ''} {p.get('category') or ''} {p.get('brand') or ''}".strip()
-        for p in INDEXED_PRODUCTS
-    ]
-    
-    if prod_texts:
-        PRODUCT_EMBEDDINGS = model.encode(prod_texts, normalize_embeddings=True)
-    else:
-        PRODUCT_EMBEDDINGS = np.empty((0, 384))
-
-    # 2. Fetch live stores
-    store_res = supabase.table("store_details").select("store_id, store_name, store_address, store_district, store_state").execute()
-    INDEXED_STORES = store_res.data or []
-    
-    store_texts = [
-        f"{s.get('store_name') or ''} {s.get('store_address') or ''} {s.get('store_district') or ''} {s.get('store_state') or ''}".strip()
-        for s in INDEXED_STORES
-    ]
-    
-    if store_texts:
-        STORE_EMBEDDINGS = model.encode(store_texts, normalize_embeddings=True)
-    else:
-        STORE_EMBEDDINGS = np.empty((0, 384))
+    global INDEXED_PRODUCTS, INDEXED_STORES, PRODUCT_EMBEDDINGS, STORE_EMBEDDINGS, IS_LOADING
+    if IS_LOADING:
+        return
+    IS_LOADING = True
+    try:
+        print("🔄 Fetching live products & stores from Supabase PostgreSQL database...")
+        m = get_model()
+        prod_res = supabase.table("product").select("prod_id, prod_name, prod_description, category, brand").execute()
+        INDEXED_PRODUCTS = prod_res.data or []
         
-    print(f"✅ Loaded {len(INDEXED_PRODUCTS)} live products and {len(INDEXED_STORES)} live stores from Supabase!")
+        prod_texts = [
+            f"{p.get('prod_name') or ''} {p.get('prod_description') or ''} {p.get('category') or ''} {p.get('brand') or ''}".strip()
+            for p in INDEXED_PRODUCTS
+        ]
+        PRODUCT_EMBEDDINGS = m.encode(prod_texts, normalize_embeddings=True) if prod_texts else np.empty((0, 384))
+
+        store_res = supabase.table("store_details").select("store_id, store_name, store_address, store_district, store_state").execute()
+        INDEXED_STORES = store_res.data or []
+        
+        store_texts = [
+            f"{s.get('store_name') or ''} {s.get('store_address') or ''} {s.get('store_district') or ''} {s.get('store_state') or ''}".strip()
+            for s in INDEXED_STORES
+        ]
+        STORE_EMBEDDINGS = m.encode(store_texts, normalize_embeddings=True) if store_texts else np.empty((0, 384))
+            
+        print(f"✅ Loaded {len(INDEXED_PRODUCTS)} live products and {len(INDEXED_STORES)} live stores!")
+    except Exception as e:
+        print(f"⚠️ Error loading embeddings: {e}")
+    finally:
+        IS_LOADING = False
 
 @app.on_event("startup")
 def startup_event():
-    reload_database_embeddings()
+    # Load embeddings in background thread so Uvicorn port binds instantly for Render health check
+    threading.Thread(target=reload_database_embeddings, daemon=True).start()
 
-def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray:
-    if doc_vecs.shape[0] == 0:
-        return np.array([])
-    return np.dot(doc_vecs, query_vec)
-
+@app.get("/")
 @app.get("/health")
 def health_check():
-    return {
-        "status": "ok",
-        "model": MODEL_NAME,
-        "live_products_count": len(INDEXED_PRODUCTS),
-        "live_stores_count": len(INDEXED_STORES)
-    }
+    return {"status": "ok", "products": len(INDEXED_PRODUCTS), "stores": len(INDEXED_STORES), "loading": IS_LOADING}
 
 @app.post("/reload")
 def reload_index():
-    reload_database_embeddings()
-    return {"status": "reloaded", "products": len(INDEXED_PRODUCTS), "stores": len(INDEXED_STORES)}
+    threading.Thread(target=reload_database_embeddings, daemon=True).start()
+    return {"status": "reloading_started"}
 
 @app.post("/predict", response_model=SearchMLResponse)
 def search_semantic(request: SearchQueryRequest):
     if not request.query or not request.query.strip():
         return SearchMLResponse(product_ids=[], store_ids=[])
 
-    # 1. Generate query embedding vector
-    query_vector = model.encode(request.query.strip(), normalize_embeddings=True)
+    m = get_model()
+    query_vector = m.encode(request.query.strip(), normalize_embeddings=True)
 
     matching_product_ids = []
     if PRODUCT_EMBEDDINGS is not None and PRODUCT_EMBEDDINGS.shape[0] > 0:
-        product_scores = cosine_similarity(query_vector, PRODUCT_EMBEDDINGS)
+        product_scores = np.dot(PRODUCT_EMBEDDINGS, query_vector)
         top_product_indices = np.argsort(product_scores)[::-1][:request.top_k_products]
         matching_product_ids = [
             int(INDEXED_PRODUCTS[i]["prod_id"])
@@ -124,7 +120,7 @@ def search_semantic(request: SearchQueryRequest):
 
     matching_store_ids = []
     if STORE_EMBEDDINGS is not None and STORE_EMBEDDINGS.shape[0] > 0:
-        store_scores = cosine_similarity(query_vector, STORE_EMBEDDINGS)
+        store_scores = np.dot(STORE_EMBEDDINGS, query_vector)
         top_store_indices = np.argsort(store_scores)[::-1][:request.top_k_stores]
         matching_store_ids = [
             int(INDEXED_STORES[i]["store_id"])
@@ -132,11 +128,9 @@ def search_semantic(request: SearchQueryRequest):
             if i < len(INDEXED_STORES) and INDEXED_STORES[i].get("store_id") is not None and store_scores[i] > 0.1
         ]
 
-    return SearchMLResponse(
-        product_ids=matching_product_ids,
-        store_ids=matching_store_ids
-    )
+    return SearchMLResponse(product_ids=matching_product_ids, store_ids=matching_store_ids)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
