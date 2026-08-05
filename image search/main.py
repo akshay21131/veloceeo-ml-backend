@@ -2,7 +2,7 @@ import os
 import io
 import threading
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
@@ -34,12 +34,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXV
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 model = None
 
+class ImageSearchRequestPayload(BaseModel):
+    image_url: Optional[str] = None
+    top_k: Optional[int] = 10
+
 class ImageSearchResponse(BaseModel):
     product_ids: List[int]
 
 INDEXED_PRODUCTS = []
 PRODUCT_IMAGE_EMBEDDINGS = None
-IS_INDEXED = False
 
 def get_model():
     global model
@@ -48,11 +51,9 @@ def get_model():
     return model
 
 def load_and_embed_product_images():
-    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS, IS_INDEXED
-    if IS_INDEXED:
-        return
+    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
     try:
-        print("🖼️ Precomputing product image embeddings in background...")
+        print("🖼️ Loading product images from Supabase DB...")
         m = get_model()
         res = supabase.table("product").select("prod_id, prod_name, prod_image_urls").execute()
         raw_products = res.data or []
@@ -60,29 +61,28 @@ def load_and_embed_product_images():
         indexed_prods = []
         embeddings_list = []
 
-        # Fast non-blocking fetch with short 2s timeout per image
+        headers = {"User-Agent": "Mozilla/5.0"}
         for prod in raw_products:
             prod_id = prod.get("prod_id")
             image_urls = prod.get("prod_image_urls") or []
-            for url in image_urls[:2]:  # Limit to max 2 images per product for high speed
+            for url in image_urls:
                 if not url or not isinstance(url, str):
                     continue
                 try:
-                    img_resp = requests.get(url, timeout=2)
+                    img_resp = requests.get(url, headers=headers, timeout=5)
                     if img_resp.status_code == 200:
                         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
                         img_emb = m.encode(img, normalize_embeddings=True)
                         embeddings_list.append(img_emb)
                         indexed_prods.append({"prod_id": prod_id, "url": url})
                 except Exception as e:
-                    print(f"⚠️ Fast skip image {url}: {e}")
+                    print(f"⚠️ Image download skip {url}: {e}")
 
         INDEXED_PRODUCTS = indexed_prods
         PRODUCT_IMAGE_EMBEDDINGS = np.array(embeddings_list) if embeddings_list else np.empty((0, 512))
-        IS_INDEXED = True
         print(f"✅ Loaded visual embeddings for {len(INDEXED_PRODUCTS)} product images!")
     except Exception as e:
-        print(f"⚠️ Error loading image embeddings: {e}")
+        print(f"⚠️ Error loading embeddings: {e}")
 
 @app.on_event("startup")
 def startup_event():
@@ -91,42 +91,61 @@ def startup_event():
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "indexed_images_count": len(INDEXED_PRODUCTS), "is_indexed": IS_INDEXED}
+    return {"status": "ok", "indexed_images_count": len(INDEXED_PRODUCTS)}
 
 @app.post("/reload")
 def reload_index():
-    global IS_INDEXED
-    IS_INDEXED = False
     threading.Thread(target=load_and_embed_product_images, daemon=True).start()
     return {"status": "reloading_started"}
 
 @app.post("/search-image", response_model=ImageSearchResponse)
 async def search_by_image(
+    request: Request,
     file: Optional[UploadFile] = File(None),
     image_url: Optional[str] = Form(None),
     top_k: int = 10
 ):
     query_image = None
+    target_url = image_url
+
+    # Check if request is JSON body
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            body_json = await request.json()
+            if isinstance(body_json, dict):
+                target_url = body_json.get("image_url") or target_url
+                top_k = body_json.get("top_k") or top_k
+        except Exception:
+            pass
+
     if file:
         contents = await file.read()
         query_image = Image.open(io.BytesIO(contents)).convert("RGB")
-    elif image_url:
-        resp = requests.get(image_url, timeout=3)
+    elif target_url:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(target_url, headers=headers, timeout=5)
         if resp.status_code == 200:
             query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
 
     if not query_image:
-        raise HTTPException(status_code=400, detail="Please upload an image file or provide an image_url")
+        # Fallback if query image cannot be fetched: return top products
+        res = supabase.table("product").select("prod_id").limit(top_k).execute()
+        pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
+        return ImageSearchResponse(product_ids=pids)
 
     m = get_model()
     query_embedding = m.encode(query_image, normalize_embeddings=True)
 
     if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
-        # Fallback if background indexing is still running: return top product IDs
+        load_and_embed_product_images()
+
+    if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
         res = supabase.table("product").select("prod_id").limit(top_k).execute()
         pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
+    # Calculate cosine similarity dot product
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
     top_indices = np.argsort(scores)[::-1]
 
@@ -134,8 +153,6 @@ async def search_by_image(
     matching_prod_ids = []
 
     for idx in top_indices:
-        if scores[idx] < 0.1:
-            break
         pid = INDEXED_PRODUCTS[idx]["prod_id"]
         if pid not in seen_prod_ids:
             seen_prod_ids.add(pid)

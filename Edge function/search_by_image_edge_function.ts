@@ -1,8 +1,8 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// Replace with your deployed Python Image Search ML URL (e.g. Railway, Render, Cloud Run)
-const IMAGE_ML_SERVICE_URL = Deno.env.get("IMAGE_ML_SERVICE_URL") ?? "https://your-image-ml-api.com/search-image";
+// ⚠️ Ensure IMAGE_ML_SERVICE_URL matches your live Render service URL
+const IMAGE_ML_SERVICE_URL = Deno.env.get("IMAGE_ML_SERVICE_URL") ?? "https://veloceeo-image-search.onrender.com/search-image";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -17,17 +17,20 @@ serve(async (req) => {
   try {
     const contentType = req.headers.get("content-type") || "";
     let bodyData: any;
+    let fetchHeaders: Record<string, string> = {};
 
     if (contentType.includes("multipart/form-data")) {
-      const formData = await req.formData();
-      bodyData = formData;
+      bodyData = await req.formData();
     } else {
-      bodyData = JSON.stringify(await req.json());
+      const rawJson = await req.json();
+      bodyData = JSON.stringify(rawJson);
+      fetchHeaders["Content-Type"] = "application/json";
     }
 
-    // 1. Forward image payload to Python CLIP ML Image Search Microservice
+    // 1. Forward image payload to Render CLIP Image ML Microservice
     const mlResponse = await fetch(IMAGE_ML_SERVICE_URL, {
       method: "POST",
+      headers: fetchHeaders,
       body: bodyData,
     });
 
