@@ -11,12 +11,14 @@ import numpy as np
 from PIL import Image
 import requests
 import torch
+import torchvision.models as models
+import torchvision.transforms as transforms
 from sentence_transformers import SentenceTransformer
 
 torch.set_num_threads(1)
 
 app = FastAPI(
-    title="Veloceeo Unified ML Microservice",
+    title="Veloceeo Lightweight ML Microservice",
     description="Combined Text Semantic Search & Vision Image Search API",
     version="1.0.0"
 )
@@ -39,7 +41,12 @@ HEADERS = {
 }
 
 text_model = None
-clip_model = None
+vision_model = None
+vision_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
 class SearchQueryRequest(BaseModel):
     query: str
@@ -67,11 +74,30 @@ def get_text_model():
         text_model = SentenceTransformer("all-MiniLM-L6-v2")
     return text_model
 
-def get_clip_model():
-    global clip_model
-    if clip_model is None:
-        clip_model = SentenceTransformer("clip-ViT-B-32")
-    return clip_model
+def get_vision_model():
+    global vision_model
+    if vision_model is None:
+        weights = models.MobileNet_V2_Weights.DEFAULT
+        m = models.mobilenet_v2(weights=weights)
+        m.eval()
+        vision_model = torch.nn.Sequential(*list(m.children())[:-1])
+    return vision_model
+
+def extract_image_features(pil_img: Image.Image) -> np.ndarray:
+    try:
+        vm = get_vision_model()
+        tensor = vision_transform(pil_img).unsqueeze(0)
+        with torch.no_grad():
+            feat = vm(tensor)
+            feat = torch.nn.functional.adaptive_avg_pool2d(feat, (1, 1))
+            vec = feat.squeeze().numpy()
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            return vec
+    except Exception as e:
+        print(f"⚠️ Feature extraction error: {e}")
+        return np.zeros(1280)
 
 def parse_image_urls(raw_urls) -> List[str]:
     if not raw_urls:
@@ -96,9 +122,8 @@ def preload_all_embeddings():
     global INDEXED_PRODUCTS, INDEXED_STORES, PRODUCT_TEXT_EMBEDDINGS, STORE_TEXT_EMBEDDINGS
     global INDEXED_IMAGE_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
     try:
-        print("⚡ Precomputing text & visual embeddings via REST API...")
+        print("⚡ Precomputing text & visual embeddings (Ultra-lightweight RAM mode)...")
         tm = get_text_model()
-        cm = get_clip_model()
 
         prod_url = f"{SUPABASE_URL}/rest/v1/product?select=prod_id,prod_name,prod_description,prod_image_urls,category,brand"
         prod_resp = requests.get(prod_url, headers=HEADERS, timeout=10)
@@ -134,14 +159,14 @@ def preload_all_embeddings():
                     img_resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
                     if img_resp.status_code == 200:
                         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
-                        img_emb = cm.encode(img, normalize_embeddings=True)
+                        img_emb = extract_image_features(img)
                         img_embeddings_list.append(img_emb)
                         indexed_img_prods.append({"prod_id": prod_id, "url": url})
                 except Exception as e:
                     print(f"⚠️ Image skip {url}: {e}")
 
         INDEXED_IMAGE_PRODUCTS = indexed_img_prods
-        PRODUCT_IMAGE_EMBEDDINGS = np.array(img_embeddings_list) if img_embeddings_list else np.empty((0, 512))
+        PRODUCT_IMAGE_EMBEDDINGS = np.array(img_embeddings_list) if img_embeddings_list else np.empty((0, 1280))
         print(f"✅ Loaded {len(INDEXED_PRODUCTS)} products & {len(INDEXED_IMAGE_PRODUCTS)} product images!")
     except Exception as e:
         print(f"⚠️ Preload error: {e}")
@@ -251,8 +276,7 @@ async def search_by_image(
         pids = [int(p["prod_id"]) for p in (prod_resp.json() or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
-    cm = get_clip_model()
-    query_embedding = cm.encode(query_image, normalize_embeddings=True)
+    query_embedding = extract_image_features(query_image)
 
     if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
         prod_resp = requests.get(f"{SUPABASE_URL}/rest/v1/product?select=prod_id&limit={top_k}", headers=HEADERS)
