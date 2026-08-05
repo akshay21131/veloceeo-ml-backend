@@ -75,10 +75,14 @@ def reload_database_embeddings():
     except Exception as e:
         print(f"⚠️ Error loading embeddings: {e}")
 
+@app.on_event("startup")
+def startup_event():
+    threading.Thread(target=reload_database_embeddings, daemon=True).start()
+
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "indexed_products_count": len(INDEXED_PRODUCTS)}
 
 @app.post("/reload")
 def reload_index():
@@ -90,7 +94,7 @@ def search_semantic(request: SearchQueryRequest):
     if not request.query or not request.query.strip():
         return SearchMLResponse(product_ids=[], store_ids=[])
 
-    if PRODUCT_EMBEDDINGS is None:
+    if PRODUCT_EMBEDDINGS is None or PRODUCT_EMBEDDINGS.shape[0] == 0:
         reload_database_embeddings()
 
     m = get_model()
@@ -100,20 +104,28 @@ def search_semantic(request: SearchQueryRequest):
     if PRODUCT_EMBEDDINGS is not None and PRODUCT_EMBEDDINGS.shape[0] > 0:
         product_scores = np.dot(PRODUCT_EMBEDDINGS, query_vector)
         top_product_indices = np.argsort(product_scores)[::-1][:request.top_k_products]
+        
+        top_score = product_scores[top_product_indices[0]] if len(top_product_indices) > 0 else 0
+        min_threshold = max(0.30, top_score * 0.70)
+        
         matching_product_ids = [
             int(INDEXED_PRODUCTS[i]["prod_id"])
             for i in top_product_indices
-            if i < len(INDEXED_PRODUCTS) and INDEXED_PRODUCTS[i].get("prod_id") is not None and product_scores[i] > 0.1
+            if i < len(INDEXED_PRODUCTS) and INDEXED_PRODUCTS[i].get("prod_id") is not None and product_scores[i] >= min_threshold
         ]
 
     matching_store_ids = []
     if STORE_EMBEDDINGS is not None and STORE_EMBEDDINGS.shape[0] > 0:
         store_scores = np.dot(STORE_EMBEDDINGS, query_vector)
         top_store_indices = np.argsort(store_scores)[::-1][:request.top_k_stores]
+        
+        top_store_score = store_scores[top_store_indices[0]] if len(top_store_indices) > 0 else 0
+        min_store_threshold = max(0.30, top_store_score * 0.70)
+        
         matching_store_ids = [
             int(INDEXED_STORES[i]["store_id"])
             for i in top_store_indices
-            if i < len(INDEXED_STORES) and INDEXED_STORES[i].get("store_id") is not None and store_scores[i] > 0.1
+            if i < len(INDEXED_STORES) and INDEXED_STORES[i].get("store_id") is not None and store_scores[i] >= min_store_threshold
         ]
 
     return SearchMLResponse(product_ids=matching_product_ids, store_ids=matching_store_ids)
