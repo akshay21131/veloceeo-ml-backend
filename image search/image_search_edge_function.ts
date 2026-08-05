@@ -15,22 +15,12 @@ serve(async (req) => {
   }
 
   try {
-    const contentType = req.headers.get("content-type") || "";
-    let bodyData: any;
-    let fetchHeaders: Record<string, string> = {};
+    const bodyData = await req.text();
 
-    if (contentType.includes("multipart/form-data")) {
-      bodyData = await req.formData();
-    } else {
-      const rawJson = await req.json();
-      bodyData = JSON.stringify(rawJson);
-      fetchHeaders["Content-Type"] = "application/json";
-    }
-
-    // 1. Forward image payload to Render CLIP Image ML Microservice
+    // 1. Forward Base64/JSON image payload to Render CLIP Image ML Microservice
     const mlResponse = await fetch(IMAGE_ML_SERVICE_URL, {
       method: "POST",
-      headers: fetchHeaders,
+      headers: { "Content-Type": "application/json" },
       body: bodyData,
     });
 

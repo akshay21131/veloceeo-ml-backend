@@ -1,5 +1,6 @@
 import os
 import io
+import base64
 import threading
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
@@ -35,6 +36,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 model = None
 
 class ImageSearchRequestPayload(BaseModel):
+    image_base64: Optional[str] = None
     image_url: Optional[str] = None
     top_k: Optional[int] = 10
 
@@ -107,29 +109,38 @@ async def search_by_image(
 ):
     query_image = None
     target_url = image_url
+    target_base64 = None
 
-    # Check if request is JSON body
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         try:
             body_json = await request.json()
             if isinstance(body_json, dict):
                 target_url = body_json.get("image_url") or target_url
+                target_base64 = body_json.get("image_base64")
                 top_k = body_json.get("top_k") or top_k
         except Exception:
             pass
 
-    if file:
+    if target_base64:
+        try:
+            clean_b64 = target_base64.split(",")[-1]
+            image_bytes = base64.b64decode(clean_b64)
+            query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception as e:
+            print(f"⚠️ Base64 decode error: {e}")
+
+    if not query_image and file:
         contents = await file.read()
         query_image = Image.open(io.BytesIO(contents)).convert("RGB")
-    elif target_url:
+
+    if not query_image and target_url:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(target_url, headers=headers, timeout=5)
         if resp.status_code == 200:
             query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
 
     if not query_image:
-        # Fallback if query image cannot be fetched: return top products
         res = supabase.table("product").select("prod_id").limit(top_k).execute()
         pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
@@ -145,7 +156,6 @@ async def search_by_image(
         pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
-    # Calculate cosine similarity dot product
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
     top_indices = np.argsort(scores)[::-1]
 
