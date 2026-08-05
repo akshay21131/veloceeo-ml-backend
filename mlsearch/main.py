@@ -5,7 +5,7 @@ import base64
 import json
 import threading
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
@@ -57,6 +57,13 @@ class SearchQueryRequest(BaseModel):
 class SearchMLResponse(BaseModel):
     product_ids: List[int]
     store_ids: List[int]
+
+class ImageSearchPayload(BaseModel):
+    image_base64: Optional[str] = None
+    imageBase64: Optional[str] = None
+    image_url: Optional[str] = None
+    imageUrl: Optional[str] = None
+    top_k: Optional[int] = 10
 
 class ImageSearchResponse(BaseModel):
     product_ids: List[int]
@@ -119,7 +126,7 @@ def parse_image_urls(raw_urls) -> List[str]:
 def preload_db_records():
     global INDEXED_PRODUCTS, INDEXED_STORES
     try:
-        print("⚡ Preloading DB records (RAM < 20MB)...")
+        print("⚡ Preloading DB records...")
         prod_url = f"{SUPABASE_URL}/rest/v1/product?select=prod_id,prod_name,prod_description,prod_image_urls,category,brand"
         prod_resp = requests.get(prod_url, headers=HEADERS, timeout=5)
         INDEXED_PRODUCTS = prod_resp.json() if prod_resp.status_code == 200 else []
@@ -194,27 +201,12 @@ def search_semantic(request: SearchQueryRequest):
     return SearchMLResponse(product_ids=matching_product_ids, store_ids=matching_store_ids)
 
 @app.post("/search-image", response_model=ImageSearchResponse)
-async def search_by_image(
-    request: Request,
-    file: Optional[UploadFile] = File(None),
-    image_url: Optional[str] = Form(None),
-    image_base64: Optional[str] = Form(None),
-    top_k: int = 10
-):
+@app.post("/search_image", response_model=ImageSearchResponse)
+async def search_by_image(payload: ImageSearchPayload):
     query_image = None
-    target_url = image_url
-    target_base64 = image_base64
-
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            body_json = await request.json()
-            if isinstance(body_json, dict):
-                target_url = body_json.get("image_url") or body_json.get("imageUrl") or target_url
-                target_base64 = body_json.get("image_base64") or body_json.get("imageBase64") or target_base64
-                top_k = body_json.get("top_k") or top_k
-        except Exception:
-            pass
+    target_base64 = payload.image_base64 or payload.imageBase64
+    target_url = payload.image_url or payload.imageUrl
+    top_k = payload.top_k or 10
 
     if target_base64:
         try:
@@ -223,13 +215,6 @@ async def search_by_image(
             query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
             print(f"⚠️ Base64 decode error: {e}")
-
-    if not query_image and file:
-        try:
-            contents = await file.read()
-            query_image = Image.open(io.BytesIO(contents)).convert("RGB")
-        except Exception as e:
-            print(f"⚠️ File read error: {e}")
 
     if not query_image and target_url:
         try:
