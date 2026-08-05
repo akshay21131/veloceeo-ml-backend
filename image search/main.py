@@ -9,6 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 from PIL import Image
+try:
+    import pillow_avif
+except Exception:
+    pass
 import requests
 import torch
 from sentence_transformers import SentenceTransformer
@@ -179,7 +183,6 @@ async def search_by_image(
         pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
-    # Compute visual cosine similarity matches
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
     top_indices = np.argsort(scores)[::-1]
 

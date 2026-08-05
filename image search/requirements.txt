@@ -2,6 +2,7 @@
 torch
 sentence-transformers
 pillow
+pillow-avif-plugin
 requests
 fastapi
 uvicorn
