@@ -1,5 +1,6 @@
 import os
 import io
+import gc
 import base64
 import json
 import threading
@@ -18,7 +19,7 @@ from sentence_transformers import SentenceTransformer
 torch.set_num_threads(1)
 
 app = FastAPI(
-    title="Veloceeo Instant ML Microservice",
+    title="Veloceeo Fast ML Microservice",
     description="Combined Text Semantic Search & Vision Image Search API",
     version="1.0.0"
 )
@@ -62,11 +63,6 @@ class ImageSearchResponse(BaseModel):
 
 INDEXED_PRODUCTS = []
 INDEXED_STORES = []
-PRODUCT_TEXT_EMBEDDINGS = None
-STORE_TEXT_EMBEDDINGS = None
-
-INDEXED_IMAGE_PRODUCTS = []
-PRODUCT_IMAGE_EMBEDDINGS = None
 
 def get_text_model():
     global text_model
@@ -87,13 +83,15 @@ def extract_image_features(pil_img: Image.Image) -> np.ndarray:
     try:
         vm = get_vision_model()
         tensor = vision_transform(pil_img).unsqueeze(0)
-        with torch.no_grad():
+        with torch.inference_mode():
             feat = vm(tensor)
             feat = torch.nn.functional.adaptive_avg_pool2d(feat, (1, 1))
             vec = feat.squeeze().numpy()
             norm = np.linalg.norm(vec)
             if norm > 0:
                 vec = vec / norm
+            del tensor, feat
+            gc.collect()
             return vec
     except Exception as e:
         print(f"⚠️ Feature extraction error: {e}")
@@ -120,41 +118,16 @@ def parse_image_urls(raw_urls) -> List[str]:
 
 def preload_db_records():
     global INDEXED_PRODUCTS, INDEXED_STORES
-    global INDEXED_IMAGE_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
     try:
-        print("⚡ Preloading DB records & image vectors...")
+        print("⚡ Preloading DB records (RAM < 20MB)...")
         prod_url = f"{SUPABASE_URL}/rest/v1/product?select=prod_id,prod_name,prod_description,prod_image_urls,category,brand"
         prod_resp = requests.get(prod_url, headers=HEADERS, timeout=5)
-        raw_products = prod_resp.json() if prod_resp.status_code == 200 else []
-        INDEXED_PRODUCTS = raw_products
+        INDEXED_PRODUCTS = prod_resp.json() if prod_resp.status_code == 200 else []
 
         store_url = f"{SUPABASE_URL}/rest/v1/store_details?select=store_id,store_name,store_address,store_district,store_state"
         store_resp = requests.get(store_url, headers=HEADERS, timeout=5)
         INDEXED_STORES = store_resp.json() if store_resp.status_code == 200 else []
-
-        img_embeddings_list = []
-        indexed_img_prods = []
-
-        for prod in raw_products:
-            prod_id = prod.get("prod_id")
-            raw_urls = prod.get("prod_image_urls")
-            image_urls = parse_image_urls(raw_urls)
-            for url in image_urls:
-                if not url or not url.startswith("http"):
-                    continue
-                try:
-                    img_resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                    if img_resp.status_code == 200:
-                        img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
-                        img_emb = extract_image_features(img)
-                        img_embeddings_list.append(img_emb)
-                        indexed_img_prods.append({"prod_id": prod_id, "url": url})
-                except Exception as e:
-                    print(f"⚠️ Image skip {url}: {e}")
-
-        INDEXED_IMAGE_PRODUCTS = indexed_img_prods
-        PRODUCT_IMAGE_EMBEDDINGS = np.array(img_embeddings_list) if img_embeddings_list else np.empty((0, 1280))
-        print(f"✅ Precomputed {len(INDEXED_PRODUCTS)} products & {len(INDEXED_IMAGE_PRODUCTS)} image vectors!")
+        print(f"✅ Loaded {len(INDEXED_PRODUCTS)} products & {len(INDEXED_STORES)} stores!")
     except Exception as e:
         print(f"⚠️ DB preload error: {e}")
 
@@ -168,7 +141,7 @@ def health_check():
     return {
         "status": "ok",
         "indexed_products_count": len(INDEXED_PRODUCTS),
-        "indexed_images_count": len(INDEXED_IMAGE_PRODUCTS)
+        "indexed_stores_count": len(INDEXED_STORES)
     }
 
 @app.post("/predict", response_model=SearchMLResponse)
@@ -225,11 +198,12 @@ async def search_by_image(
     request: Request,
     file: Optional[UploadFile] = File(None),
     image_url: Optional[str] = Form(None),
+    image_base64: Optional[str] = Form(None),
     top_k: int = 10
 ):
     query_image = None
     target_url = image_url
-    target_base64 = None
+    target_base64 = image_base64
 
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -237,7 +211,7 @@ async def search_by_image(
             body_json = await request.json()
             if isinstance(body_json, dict):
                 target_url = body_json.get("image_url") or body_json.get("imageUrl") or target_url
-                target_base64 = body_json.get("image_base64") or body_json.get("imageBase64")
+                target_base64 = body_json.get("image_base64") or body_json.get("imageBase64") or target_base64
                 top_k = body_json.get("top_k") or top_k
         except Exception:
             pass
@@ -265,29 +239,55 @@ async def search_by_image(
         except Exception as e:
             print(f"⚠️ Image URL fetch error: {e}")
 
-    if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
+    if not INDEXED_PRODUCTS:
         preload_db_records()
 
-    if not query_image or PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
+    if not query_image:
         pids = [int(p["prod_id"]) for p in INDEXED_PRODUCTS if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids[:top_k])
 
     query_embedding = extract_image_features(query_image)
 
-    scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
+    img_embeddings_list = []
+    indexed_img_prods = []
+
+    for prod in INDEXED_PRODUCTS:
+        prod_id = prod.get("prod_id")
+        raw_urls = prod.get("prod_image_urls")
+        image_urls = parse_image_urls(raw_urls)
+        for url in image_urls:
+            if not url or not url.startswith("http"):
+                continue
+            try:
+                img_resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                if img_resp.status_code == 200:
+                    img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+                    img_emb = extract_image_features(img)
+                    img_embeddings_list.append(img_emb)
+                    indexed_img_prods.append({"prod_id": prod_id, "url": url})
+            except Exception as e:
+                print(f"⚠️ Image skip {url}: {e}")
+
+    if not img_embeddings_list:
+        pids = [int(p["prod_id"]) for p in INDEXED_PRODUCTS if p.get("prod_id")]
+        return ImageSearchResponse(product_ids=pids[:top_k])
+
+    prod_img_matrix = np.array(img_embeddings_list)
+    scores = np.dot(prod_img_matrix, query_embedding)
     top_indices = np.argsort(scores)[::-1]
 
     seen_prod_ids = set()
     matching_prod_ids = []
 
     for idx in top_indices:
-        pid = INDEXED_IMAGE_PRODUCTS[idx]["prod_id"]
+        pid = indexed_img_prods[idx]["prod_id"]
         if pid not in seen_prod_ids:
             seen_prod_ids.add(pid)
             matching_prod_ids.append(int(pid))
             if len(matching_prod_ids) >= top_k:
                 break
 
+    gc.collect()
     return ImageSearchResponse(product_ids=matching_prod_ids)
 
 if __name__ == "__main__":
