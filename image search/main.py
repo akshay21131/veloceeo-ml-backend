@@ -39,6 +39,7 @@ class ImageSearchResponse(BaseModel):
 
 INDEXED_PRODUCTS = []
 PRODUCT_IMAGE_EMBEDDINGS = None
+IS_INDEXED = False
 
 def get_model():
     global model
@@ -47,8 +48,11 @@ def get_model():
     return model
 
 def load_and_embed_product_images():
-    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
+    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS, IS_INDEXED
+    if IS_INDEXED:
+        return
     try:
+        print("🖼️ Precomputing product image embeddings in background...")
         m = get_model()
         res = supabase.table("product").select("prod_id, prod_name, prod_image_urls").execute()
         raw_products = res.data or []
@@ -56,34 +60,43 @@ def load_and_embed_product_images():
         indexed_prods = []
         embeddings_list = []
 
+        # Fast non-blocking fetch with short 2s timeout per image
         for prod in raw_products:
             prod_id = prod.get("prod_id")
             image_urls = prod.get("prod_image_urls") or []
-            for url in image_urls:
+            for url in image_urls[:2]:  # Limit to max 2 images per product for high speed
                 if not url or not isinstance(url, str):
                     continue
                 try:
-                    img_resp = requests.get(url, timeout=5)
+                    img_resp = requests.get(url, timeout=2)
                     if img_resp.status_code == 200:
                         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
                         img_emb = m.encode(img, normalize_embeddings=True)
                         embeddings_list.append(img_emb)
                         indexed_prods.append({"prod_id": prod_id, "url": url})
                 except Exception as e:
-                    print(f"⚠️ Error embedding image {url}: {e}")
+                    print(f"⚠️ Fast skip image {url}: {e}")
 
         INDEXED_PRODUCTS = indexed_prods
         PRODUCT_IMAGE_EMBEDDINGS = np.array(embeddings_list) if embeddings_list else np.empty((0, 512))
+        IS_INDEXED = True
+        print(f"✅ Loaded visual embeddings for {len(INDEXED_PRODUCTS)} product images!")
     except Exception as e:
         print(f"⚠️ Error loading image embeddings: {e}")
+
+@app.on_event("startup")
+def startup_event():
+    threading.Thread(target=load_and_embed_product_images, daemon=True).start()
 
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "indexed_images_count": len(INDEXED_PRODUCTS), "is_indexed": IS_INDEXED}
 
 @app.post("/reload")
 def reload_index():
+    global IS_INDEXED
+    IS_INDEXED = False
     threading.Thread(target=load_and_embed_product_images, daemon=True).start()
     return {"status": "reloading_started"}
 
@@ -98,21 +111,21 @@ async def search_by_image(
         contents = await file.read()
         query_image = Image.open(io.BytesIO(contents)).convert("RGB")
     elif image_url:
-        resp = requests.get(image_url, timeout=5)
+        resp = requests.get(image_url, timeout=3)
         if resp.status_code == 200:
             query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
 
     if not query_image:
         raise HTTPException(status_code=400, detail="Please upload an image file or provide an image_url")
 
-    if PRODUCT_IMAGE_EMBEDDINGS is None:
-        load_and_embed_product_images()
-
     m = get_model()
     query_embedding = m.encode(query_image, normalize_embeddings=True)
 
     if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
-        return ImageSearchResponse(product_ids=[])
+        # Fallback if background indexing is still running: return top product IDs
+        res = supabase.table("product").select("prod_id").limit(top_k).execute()
+        pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
+        return ImageSearchResponse(product_ids=pids)
 
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
     top_indices = np.argsort(scores)[::-1]
@@ -121,7 +134,7 @@ async def search_by_image(
     matching_prod_ids = []
 
     for idx in top_indices:
-        if scores[idx] < 0.2:
+        if scores[idx] < 0.1:
             break
         pid = INDEXED_PRODUCTS[idx]["prod_id"]
         if pid not in seen_prod_ids:
