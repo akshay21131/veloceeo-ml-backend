@@ -9,7 +9,6 @@ import torch
 from sentence_transformers import SentenceTransformer
 from supabase import create_client, Client
 
-# Limit PyTorch memory & CPU threads for Render 512MB RAM compatibility
 torch.set_num_threads(1)
 
 app = FastAPI(
@@ -45,7 +44,6 @@ INDEXED_PRODUCTS = []
 INDEXED_STORES = []
 PRODUCT_EMBEDDINGS = None
 STORE_EMBEDDINGS = None
-IS_LOADING = False
 
 def get_model():
     global model
@@ -54,12 +52,8 @@ def get_model():
     return model
 
 def reload_database_embeddings():
-    global INDEXED_PRODUCTS, INDEXED_STORES, PRODUCT_EMBEDDINGS, STORE_EMBEDDINGS, IS_LOADING
-    if IS_LOADING:
-        return
-    IS_LOADING = True
+    global INDEXED_PRODUCTS, INDEXED_STORES, PRODUCT_EMBEDDINGS, STORE_EMBEDDINGS
     try:
-        print("🔄 Fetching live products & stores from Supabase PostgreSQL database...")
         m = get_model()
         prod_res = supabase.table("product").select("prod_id, prod_name, prod_description, category, brand").execute()
         INDEXED_PRODUCTS = prod_res.data or []
@@ -78,22 +72,13 @@ def reload_database_embeddings():
             for s in INDEXED_STORES
         ]
         STORE_EMBEDDINGS = m.encode(store_texts, normalize_embeddings=True) if store_texts else np.empty((0, 384))
-            
-        print(f"✅ Loaded {len(INDEXED_PRODUCTS)} live products and {len(INDEXED_STORES)} live stores!")
     except Exception as e:
         print(f"⚠️ Error loading embeddings: {e}")
-    finally:
-        IS_LOADING = False
-
-@app.on_event("startup")
-def startup_event():
-    # Load embeddings in background thread so Uvicorn port binds instantly for Render health check
-    threading.Thread(target=reload_database_embeddings, daemon=True).start()
 
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "products": len(INDEXED_PRODUCTS), "stores": len(INDEXED_STORES), "loading": IS_LOADING}
+    return {"status": "ok"}
 
 @app.post("/reload")
 def reload_index():
@@ -104,6 +89,9 @@ def reload_index():
 def search_semantic(request: SearchQueryRequest):
     if not request.query or not request.query.strip():
         return SearchMLResponse(product_ids=[], store_ids=[])
+
+    if PRODUCT_EMBEDDINGS is None:
+        reload_database_embeddings()
 
     m = get_model()
     query_vector = m.encode(request.query.strip(), normalize_embeddings=True)

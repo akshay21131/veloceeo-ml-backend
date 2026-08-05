@@ -12,7 +12,6 @@ import torch
 from sentence_transformers import SentenceTransformer
 from supabase import create_client, Client
 
-# Limit PyTorch memory & CPU threads for Render 512MB RAM compatibility
 torch.set_num_threads(1)
 
 app = FastAPI(
@@ -40,7 +39,6 @@ class ImageSearchResponse(BaseModel):
 
 INDEXED_PRODUCTS = []
 PRODUCT_IMAGE_EMBEDDINGS = None
-IS_LOADING = False
 
 def get_model():
     global model
@@ -49,12 +47,8 @@ def get_model():
     return model
 
 def load_and_embed_product_images():
-    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS, IS_LOADING
-    if IS_LOADING:
-        return
-    IS_LOADING = True
+    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
     try:
-        print("🖼️ Fetching product image URLs from Supabase PostgreSQL database...")
         m = get_model()
         res = supabase.table("product").select("prod_id, prod_name, prod_image_urls").execute()
         raw_products = res.data or []
@@ -80,21 +74,13 @@ def load_and_embed_product_images():
 
         INDEXED_PRODUCTS = indexed_prods
         PRODUCT_IMAGE_EMBEDDINGS = np.array(embeddings_list) if embeddings_list else np.empty((0, 512))
-        print(f"✅ Loaded visual embeddings for {len(INDEXED_PRODUCTS)} product images!")
     except Exception as e:
         print(f"⚠️ Error loading image embeddings: {e}")
-    finally:
-        IS_LOADING = False
-
-@app.on_event("startup")
-def startup_event():
-    # Load image embeddings in background thread so Uvicorn port binds instantly for Render health check
-    threading.Thread(target=load_and_embed_product_images, daemon=True).start()
 
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "indexed_images_count": len(INDEXED_PRODUCTS), "loading": IS_LOADING}
+    return {"status": "ok"}
 
 @app.post("/reload")
 def reload_index():
@@ -118,6 +104,9 @@ async def search_by_image(
 
     if not query_image:
         raise HTTPException(status_code=400, detail="Please upload an image file or provide an image_url")
+
+    if PRODUCT_IMAGE_EMBEDDINGS is None:
+        load_and_embed_product_images()
 
     m = get_model()
     query_embedding = m.encode(query_image, normalize_embeddings=True)
