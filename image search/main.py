@@ -45,6 +45,7 @@ class ImageSearchResponse(BaseModel):
 
 INDEXED_PRODUCTS = []
 PRODUCT_IMAGE_EMBEDDINGS = None
+IS_LOADING = False
 
 def get_model():
     global model
@@ -73,9 +74,12 @@ def parse_image_urls(raw_urls) -> List[str]:
     return []
 
 def load_and_embed_product_images():
-    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
+    global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS, IS_LOADING
+    if IS_LOADING:
+        return
+    IS_LOADING = True
     try:
-        print("🖼️ Loading product image URLs from Supabase database...")
+        print("🖼️ Precomputing visual embeddings for product images...")
         m = get_model()
         res = supabase.table("product").select("prod_id, prod_name, prod_image_urls").execute()
         raw_products = res.data or []
@@ -93,21 +97,22 @@ def load_and_embed_product_images():
                 if not url or not url.startswith("http"):
                     continue
                 try:
-                    img_resp = requests.get(url, headers=headers, timeout=6)
+                    img_resp = requests.get(url, headers=headers, timeout=5)
                     if img_resp.status_code == 200:
                         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
                         img_emb = m.encode(img, normalize_embeddings=True)
                         embeddings_list.append(img_emb)
                         indexed_prods.append({"prod_id": prod_id, "url": url})
-                        print(f"✅ Indexed image for Product ID {prod_id}: {url}")
                 except Exception as e:
-                    print(f"⚠️ Error downloading image {url}: {e}")
+                    print(f"⚠️ Error embedding image {url}: {e}")
 
         INDEXED_PRODUCTS = indexed_prods
         PRODUCT_IMAGE_EMBEDDINGS = np.array(embeddings_list) if embeddings_list else np.empty((0, 512))
-        print(f"🎉 Successfully precomputed visual embeddings for {len(INDEXED_PRODUCTS)} product images!")
+        print(f"✅ Precomputed embeddings for {len(INDEXED_PRODUCTS)} product images!")
     except Exception as e:
         print(f"⚠️ Error loading embeddings: {e}")
+    finally:
+        IS_LOADING = False
 
 @app.on_event("startup")
 def startup_event():
@@ -119,7 +124,7 @@ def health_check():
     return {
         "status": "ok",
         "indexed_images_count": len(INDEXED_PRODUCTS),
-        "indexed_products": [p["prod_id"] for p in INDEXED_PRODUCTS]
+        "is_loading": IS_LOADING
     }
 
 @app.post("/reload")
@@ -138,13 +143,14 @@ async def search_by_image(
     target_url = image_url
     target_base64 = None
 
+    # Parse JSON body if present
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         try:
             body_json = await request.json()
             if isinstance(body_json, dict):
-                target_url = body_json.get("image_url") or target_url
-                target_base64 = body_json.get("image_base64")
+                target_url = body_json.get("image_url") or body_json.get("imageUrl") or target_url
+                target_base64 = body_json.get("image_base64") or body_json.get("imageBase64")
                 top_k = body_json.get("top_k") or top_k
         except Exception:
             pass
@@ -158,14 +164,20 @@ async def search_by_image(
             print(f"⚠️ Base64 decode error: {e}")
 
     if not query_image and file:
-        contents = await file.read()
-        query_image = Image.open(io.BytesIO(contents)).convert("RGB")
+        try:
+            contents = await file.read()
+            query_image = Image.open(io.BytesIO(contents)).convert("RGB")
+        except Exception as e:
+            print(f"⚠️ Upload file read error: {e}")
 
     if not query_image and target_url:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(target_url, headers=headers, timeout=6)
-        if resp.status_code == 200:
-            query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(target_url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        except Exception as e:
+            print(f"⚠️ Image URL fetch error: {e}")
 
     if not query_image:
         res = supabase.table("product").select("prod_id").limit(top_k).execute()
@@ -176,13 +188,11 @@ async def search_by_image(
     query_embedding = m.encode(query_image, normalize_embeddings=True)
 
     if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
-        load_and_embed_product_images()
-
-    if PRODUCT_IMAGE_EMBEDDINGS is None or PRODUCT_IMAGE_EMBEDDINGS.shape[0] == 0:
         res = supabase.table("product").select("prod_id").limit(top_k).execute()
         pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
+    # Compute visual similarity scores
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
     top_indices = np.argsort(scores)[::-1]
 
