@@ -1,6 +1,7 @@
 import os
 import io
 import base64
+import json
 import threading
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
@@ -35,11 +36,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXV
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 model = None
 
-class ImageSearchRequestPayload(BaseModel):
-    image_base64: Optional[str] = None
-    image_url: Optional[str] = None
-    top_k: Optional[int] = 10
-
 class ImageSearchResponse(BaseModel):
     product_ids: List[int]
 
@@ -49,13 +45,33 @@ PRODUCT_IMAGE_EMBEDDINGS = None
 def get_model():
     global model
     if model is None:
+        print("⚡ Loading CLIP Vision Model...")
         model = SentenceTransformer("clip-ViT-B-32")
     return model
+
+def parse_image_urls(raw_urls) -> List[str]:
+    if not raw_urls:
+        return []
+    if isinstance(raw_urls, list):
+        return [str(u).strip() for u in raw_urls if u and isinstance(u, str)]
+    if isinstance(raw_urls, str):
+        s = raw_urls.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(u).strip() for u in parsed if u]
+            except Exception:
+                cleaned = s.strip("[]\"'").split(",")
+                return [c.strip().strip("\"'") for c in cleaned if c.strip()]
+        elif s.startswith("http"):
+            return [s]
+    return []
 
 def load_and_embed_product_images():
     global INDEXED_PRODUCTS, PRODUCT_IMAGE_EMBEDDINGS
     try:
-        print("🖼️ Loading product images from Supabase DB...")
+        print("🖼️ Loading product image URLs from Supabase database...")
         m = get_model()
         res = supabase.table("product").select("prod_id, prod_name, prod_image_urls").execute()
         raw_products = res.data or []
@@ -66,23 +82,26 @@ def load_and_embed_product_images():
         headers = {"User-Agent": "Mozilla/5.0"}
         for prod in raw_products:
             prod_id = prod.get("prod_id")
-            image_urls = prod.get("prod_image_urls") or []
+            raw_urls = prod.get("prod_image_urls")
+            image_urls = parse_image_urls(raw_urls)
+            
             for url in image_urls:
-                if not url or not isinstance(url, str):
+                if not url or not url.startswith("http"):
                     continue
                 try:
-                    img_resp = requests.get(url, headers=headers, timeout=5)
+                    img_resp = requests.get(url, headers=headers, timeout=6)
                     if img_resp.status_code == 200:
                         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
                         img_emb = m.encode(img, normalize_embeddings=True)
                         embeddings_list.append(img_emb)
                         indexed_prods.append({"prod_id": prod_id, "url": url})
+                        print(f"✅ Indexed image for Product ID {prod_id}: {url}")
                 except Exception as e:
-                    print(f"⚠️ Image download skip {url}: {e}")
+                    print(f"⚠️ Error downloading image {url}: {e}")
 
         INDEXED_PRODUCTS = indexed_prods
         PRODUCT_IMAGE_EMBEDDINGS = np.array(embeddings_list) if embeddings_list else np.empty((0, 512))
-        print(f"✅ Loaded visual embeddings for {len(INDEXED_PRODUCTS)} product images!")
+        print(f"🎉 Successfully precomputed visual embeddings for {len(INDEXED_PRODUCTS)} product images!")
     except Exception as e:
         print(f"⚠️ Error loading embeddings: {e}")
 
@@ -93,7 +112,11 @@ def startup_event():
 @app.get("/")
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "indexed_images_count": len(INDEXED_PRODUCTS)}
+    return {
+        "status": "ok",
+        "indexed_images_count": len(INDEXED_PRODUCTS),
+        "indexed_products": [p["prod_id"] for p in INDEXED_PRODUCTS]
+    }
 
 @app.post("/reload")
 def reload_index():
@@ -136,7 +159,7 @@ async def search_by_image(
 
     if not query_image and target_url:
         headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(target_url, headers=headers, timeout=5)
+        resp = requests.get(target_url, headers=headers, timeout=6)
         if resp.status_code == 200:
             query_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
 
@@ -156,6 +179,7 @@ async def search_by_image(
         pids = [int(p["prod_id"]) for p in (res.data or []) if p.get("prod_id")]
         return ImageSearchResponse(product_ids=pids)
 
+    # Compute visual cosine similarity matches
     scores = np.dot(PRODUCT_IMAGE_EMBEDDINGS, query_embedding)
     top_indices = np.argsort(scores)[::-1]
 
