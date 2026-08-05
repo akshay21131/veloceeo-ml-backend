@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers
+pillow
+pillow-avif-plugin
+requests
+fastapi
+uvicorn
+numpy
+pydantic
+python-multipart
+supabase
